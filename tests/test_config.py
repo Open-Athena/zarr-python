@@ -291,6 +291,14 @@ def test_config_buffer_backwards_compatibility_gpu() -> None:
         get_ndbuffer_class()
 
 
+@pytest.mark.gpu
+def test_enable_gpu_sets_gpu_blosc_codec() -> None:
+    with zarr.config.enable_gpu():
+        assert config.get("buffer") == "zarr.buffer.gpu.Buffer"
+        assert config.get("ndbuffer") == "zarr.buffer.gpu.NDBuffer"
+        assert config.get("codecs.blosc") == "zarr.codecs.gpu.NvcompBloscCodec"
+
+
 @pytest.mark.filterwarnings("error")
 def test_warning_on_missing_codec_config() -> None:
     class NewCodec(BytesCodec):
