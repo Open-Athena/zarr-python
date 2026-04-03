@@ -155,6 +155,46 @@ def test_nvcomp_blosc_decode_batches_multi_block_frames(
 
 
 @gpu_test
+def test_nvcomp_blosc_decode_avoids_full_chunk_host_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cupy as cp
+
+    original = cp.asnumpy
+    copied_sizes: list[int] = []
+
+    def counted(array: object) -> object:
+        size = int(getattr(array, "size", -1))
+        copied_sizes.append(size)
+        if size > 1024:
+            raise AssertionError(f"unexpected large host copy of {size} bytes")
+        return original(array)
+
+    monkeypatch.setattr(cp, "asnumpy", counted)
+
+    rng = np.random.default_rng(0)
+    src = rng.standard_normal(8192, dtype=np.float32)
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(
+        store=store,
+        shape=src.shape,
+        chunks=(8192,),
+        dtype=src.dtype,
+        compressors=BloscCodec(cname="zstd", shuffle="noshuffle", blocksize=256),
+    )
+    z[:] = src
+
+    with zarr.config.enable_gpu(), warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ZarrUserWarning)
+        zr = zarr.open_array(store=store, mode="r")
+        out = zr[:]
+
+    assert copied_sizes
+    assert isinstance(out, cp.ndarray)
+    np.testing.assert_array_equal(original(out), src)
+
+
+@gpu_test
 def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

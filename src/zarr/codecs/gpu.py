@@ -336,6 +336,61 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
             "scatter_segments",
         )
 
+    @cached_property
+    def _parse_split_headers_kernel(self) -> cp.RawKernel:
+        return cp.RawKernel(
+            r"""
+            extern "C" __global__
+            void parse_split_headers(
+                const unsigned char* source,
+                const int* bstarts,
+                const int* split_counts,
+                const long long* split_bases,
+                const long long cbytes,
+                long long* src_offsets,
+                long long* src_lengths,
+                int* error_code
+            ) {
+                if (threadIdx.x != 0) {
+                    return;
+                }
+                const int block = static_cast<int>(blockIdx.x);
+                long long p = static_cast<long long>(bstarts[block]);
+                const int nsplits = split_counts[block];
+                const long long base = split_bases[block];
+
+                for (int i = 0; i < nsplits; ++i) {
+                    if (p < 0 || p + 4 > cbytes) {
+                        atomicCAS(error_code, 0, 1);
+                        return;
+                    }
+
+                    const unsigned int csize_u =
+                        static_cast<unsigned int>(source[p]) |
+                        (static_cast<unsigned int>(source[p + 1]) << 8) |
+                        (static_cast<unsigned int>(source[p + 2]) << 16) |
+                        (static_cast<unsigned int>(source[p + 3]) << 24);
+                    const int csize = static_cast<int>(csize_u);
+                    p += 4;
+
+                    if (csize < 0) {
+                        atomicCAS(error_code, 0, 2);
+                        return;
+                    }
+                    if (p + static_cast<long long>(csize) > cbytes) {
+                        atomicCAS(error_code, 0, 3);
+                        return;
+                    }
+
+                    src_offsets[base + i] = p;
+                    src_lengths[base + i] = csize;
+                    p += static_cast<long long>(csize);
+                }
+            }
+            """,
+            "parse_split_headers",
+        )
+
     @staticmethod
     def _split_count(*, typesize: int, blocksize: int, dont_split: bool, leftover_block: bool) -> int:
         if (
@@ -426,6 +481,43 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
             n_elements=n_elements,
         )
 
+    def _parse_split_headers(
+        self,
+        source: "cp.ndarray",
+        *,
+        bstarts: np.ndarray,
+        split_counts: np.ndarray,
+        split_bases: np.ndarray,
+        cbytes: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        total_splits = int(split_counts.sum())
+        src_offsets = cp.empty((total_splits,), dtype=cp.int64)
+        src_lengths = cp.empty((total_splits,), dtype=cp.int64)
+        error_code = cp.zeros((1,), dtype=cp.int32)
+
+        self._parse_split_headers_kernel(
+            (len(bstarts),),
+            (1,),
+            (
+                source,
+                cp.asarray(bstarts),
+                cp.asarray(split_counts),
+                cp.asarray(split_bases),
+                np.int64(cbytes),
+                src_offsets,
+                src_lengths,
+                error_code,
+            ),
+        )
+
+        error_code_host = int(cp.asnumpy(error_code)[0])
+        if error_code_host == 1:
+            raise ValueError("Invalid Blosc payload: split header outside payload.")
+        if error_code_host in (2, 3):
+            raise ValueError("Invalid Blosc payload: split data outside payload.")
+
+        return cp.asnumpy(src_offsets), cp.asnumpy(src_lengths)
+
     def _build_chunk_plan(
         self,
         *,
@@ -439,15 +531,12 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
                 f"Invalid Blosc payload: expected at least {_BLOSC_MAX_OVERHEAD} bytes, got {source.size}."
             )
 
-        host_source = memoryview(cp.asnumpy(source))
-        _, _, flags, typesize, nbytes, blocksize, cbytes = struct.unpack_from(
-            "<BBBBIII", host_source, 0
-        )
+        header = memoryview(cp.asnumpy(source[:_BLOSC_MAX_OVERHEAD]))
+        _, _, flags, typesize, nbytes, blocksize, cbytes = struct.unpack_from("<BBBBIII", header, 0)
         if source.size < cbytes:
             raise ValueError(
                 f"Invalid Blosc payload: cbytes={cbytes} larger than available bytes={source.size}."
             )
-        host_source = host_source[:cbytes]
         source = source[:cbytes]
 
         is_memcpyed = (flags & _BLOSC_FLAG_MEMCPYED) != 0
@@ -487,13 +576,13 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
             raise ValueError("Invalid Blosc payload: missing block-start table.")
 
         bstarts = np.frombuffer(
-            host_source[bstarts_offset:bstarts_end],
-            dtype="<i4",
-            count=nblocks,
+            cp.asnumpy(source[bstarts_offset:bstarts_end]).tobytes(), dtype="<i4", count=nblocks
         )
 
         scratch = cp.empty((nbytes,), dtype=cp.uint8)
-        segments: list[_BloscSegmentPlan] = []
+        split_counts = np.empty((nblocks,), dtype=np.int32)
+        split_bases = np.empty((nblocks,), dtype=np.int64)
+        total_splits = 0
 
         for block_index in range(nblocks):
             bsize = leftover if (block_index == nblocks - 1 and leftover > 0) else blocksize
@@ -509,19 +598,35 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
                     f"Invalid Blosc payload: blocksize {bsize} not divisible by nsplits {nsplits}."
                 )
 
+            split_counts[block_index] = nsplits
+            split_bases[block_index] = total_splits
+            total_splits += nsplits
+
+        src_offsets, src_lengths = self._parse_split_headers(
+            source,
+            bstarts=bstarts,
+            split_counts=split_counts,
+            split_bases=split_bases,
+            cbytes=cbytes,
+        )
+
+        segments: list[_BloscSegmentPlan] = []
+        split_index_global = 0
+        for block_index in range(nblocks):
+            bsize = leftover if (block_index == nblocks - 1 and leftover > 0) else blocksize
+            leftover_block = block_index == nblocks - 1 and leftover > 0
+            nsplits = self._split_count(
+                typesize=typesize,
+                blocksize=bsize,
+                dont_split=dont_split,
+                leftover_block=leftover_block,
+            )
             neblock = bsize // nsplits
-            p = int(bstarts[block_index])
             block_start = block_index * blocksize
             for split_index in range(nsplits):
-                if p < 0 or (p + 4) > cbytes:
-                    raise ValueError("Invalid Blosc payload: split header outside payload.")
-                csize = int(struct.unpack_from("<i", host_source, p)[0])
-                p += 4
-                if csize < 0 or (p + csize) > cbytes:
-                    raise ValueError("Invalid Blosc payload: split data outside payload.")
-                split = source[p : p + csize]
-                p += csize
-
+                csize = int(src_lengths[split_index_global])
+                src_offset = int(src_offsets[split_index_global])
+                split = source[src_offset : src_offset + csize]
                 dest_offset = block_start + split_index * neblock
                 if csize == neblock:
                     segments.append(
@@ -541,6 +646,7 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
                             decode_index=decode_index,
                         )
                     )
+                split_index_global += 1
 
         bitshuffle = None
         if do_bitshuffle:
