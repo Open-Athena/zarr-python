@@ -112,6 +112,7 @@ config = Config(
             "async": {"concurrency": 10, "timeout": None},
             "threading": {"max_workers": None},
             "json_indent": 2,
+            "gpu": {"blosc_bitshuffle_max_bytes": 100 * 1024 * 1024},
             "codec_pipeline": {
                 "path": "zarr.core.codec_pipeline.BatchedCodecPipeline",
                 "batch_size": 1,

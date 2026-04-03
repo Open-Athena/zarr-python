@@ -298,6 +298,7 @@ def test_enable_gpu_sets_gpu_codecs() -> None:
         assert config.get("ndbuffer") == "zarr.buffer.gpu.NDBuffer"
         assert config.get("codecs.blosc") == "zarr.codecs.gpu.NvcompBloscCodec"
         assert config.get("codecs.zstd") == "zarr.codecs.gpu.NvcompZstdCodec"
+        assert config.get("gpu.blosc_bitshuffle_max_bytes") == 100 * 1024 * 1024
         assert config.get("codec_pipeline.path") == "zarr.core.codec_pipeline.BatchedCodecPipeline"
         assert config.get("codec_pipeline.batch_size") == 65536
 

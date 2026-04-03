@@ -12,6 +12,17 @@ from zarr.errors import ZarrUserWarning
 from zarr.testing.utils import gpu_test
 
 
+def test_nvcomp_blosc_bitshuffle_max_bytes_validation() -> None:
+    codec = NvcompBloscCodec(bitshuffle_max_bytes=1024)
+    assert codec.bitshuffle_max_bytes == 1024
+
+    with pytest.raises(ValueError):
+        NvcompBloscCodec(bitshuffle_max_bytes=0)
+
+    with pytest.raises(TypeError):
+        NvcompBloscCodec(bitshuffle_max_bytes="1024")  # type: ignore[arg-type]
+
+
 @gpu_test
 @pytest.mark.parametrize("shuffle", ["bitshuffle", "noshuffle"])
 def test_nvcomp_blosc_decode_supported(shuffle: str) -> None:
@@ -150,7 +161,9 @@ def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
     import cupy as cp
 
     calls = 0
+    scatter_calls = 0
     original = NvcompBloscCodec._run_nvcomp_zstd_batch
+    original_scatter = NvcompBloscCodec._scatter_segments
 
     async def counted(
         self: NvcompBloscCodec,
@@ -162,7 +175,17 @@ def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
         calls += 1
         return await original(self, arrays, operation=operation)
 
+    def counted_scatter(
+        self: NvcompBloscCodec,
+        chunk_plan: object,
+        decoded_splits: object,
+    ) -> None:
+        nonlocal scatter_calls
+        scatter_calls += 1
+        original_scatter(self, chunk_plan, decoded_splits)
+
     monkeypatch.setattr(NvcompBloscCodec, "_run_nvcomp_zstd_batch", counted)
+    monkeypatch.setattr(NvcompBloscCodec, "_scatter_segments", counted_scatter)
 
     src = np.arange(4096, dtype=np.float32).reshape(64, 64)
     store = zarr.storage.MemoryStore()
@@ -181,5 +204,51 @@ def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
         out = zr[:, :]
 
     assert calls == 1
+    assert scatter_calls == z.nchunks
+    assert isinstance(out, cp.ndarray)
+    cp.testing.assert_array_equal(out, cp.asarray(src))
+
+
+@gpu_test
+def test_nvcomp_blosc_bitshuffle_windowing_batches_full_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cupy as cp
+
+    calls = 0
+    original = NvcompBloscCodec._bitunshuffle_blocks
+
+    def counted(
+        src: object,
+        *,
+        typesize: int,
+        blocksize: int,
+        nblocks: int,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        return original(src, typesize=typesize, blocksize=blocksize, nblocks=nblocks)
+
+    monkeypatch.setattr(NvcompBloscCodec, "_bitunshuffle_blocks", staticmethod(counted))
+
+    src = np.arange(1024, dtype=np.float32)
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(
+        store=store,
+        shape=src.shape,
+        chunks=(1024,),
+        dtype=src.dtype,
+        compressors=BloscCodec(cname="zstd", shuffle="bitshuffle", blocksize=256),
+    )
+    z[:] = src
+
+    with zarr.config.enable_gpu(), zarr.config.set(
+        {"gpu.blosc_bitshuffle_max_bytes": 512}
+    ), warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ZarrUserWarning)
+        zr = zarr.open_array(store=store, mode="r")
+        out = zr[:]
+
+    assert calls == src.nbytes // 512
     assert isinstance(out, cp.ndarray)
     cp.testing.assert_array_equal(out, cp.asarray(src))
