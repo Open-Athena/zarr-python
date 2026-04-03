@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import zarr
+from zarr.codecs import NvcompBloscCodec
 from zarr.codecs.blosc import BloscCodec
 from zarr.errors import ZarrUserWarning
 from zarr.testing.utils import gpu_test
@@ -57,7 +58,7 @@ def test_nvcomp_blosc_decode_raises_on_byte_shuffle() -> None:
 
 
 @gpu_test
-def test_nvcomp_blosc_decode_raises_on_non_float32() -> None:
+def test_nvcomp_blosc_decode_supported_non_float32() -> None:
     src = np.arange(64, dtype=np.float64).reshape(8, 8)
     store = zarr.storage.MemoryStore()
     z = zarr.create_array(
@@ -72,8 +73,9 @@ def test_nvcomp_blosc_decode_raises_on_non_float32() -> None:
     with zarr.config.enable_gpu(), warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=ZarrUserWarning)
         zr = zarr.open_array(store=store, mode="r")
-        with pytest.raises(ValueError, match="float32"):
-            _ = zr[:, :]
+        out = zr[:, :]
+
+    np.testing.assert_array_equal(np.asarray(out), src)
 
 
 @gpu_test
@@ -94,3 +96,81 @@ def test_nvcomp_blosc_decode_raises_on_non_zstd() -> None:
         zr = zarr.open_array(store=store, mode="r")
         with pytest.raises(ValueError, match="cname='zstd'"):
             _ = zr[:, :]
+
+
+@gpu_test
+def test_nvcomp_blosc_decode_batches_multi_block_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = NvcompBloscCodec._run_nvcomp_zstd_batch
+
+    async def counted(
+        self: NvcompBloscCodec,
+        arrays: object,
+        *,
+        operation: str,
+    ) -> list[object]:
+        nonlocal calls
+        calls += 1
+        return await original(self, arrays, operation=operation)
+
+    monkeypatch.setattr(NvcompBloscCodec, "_run_nvcomp_zstd_batch", counted)
+
+    src = np.arange(2048, dtype=np.float32)
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(
+        store=store,
+        shape=src.shape,
+        chunks=(2048,),
+        dtype=src.dtype,
+        compressors=BloscCodec(cname="zstd", shuffle="noshuffle", blocksize=256),
+    )
+    z[:] = src
+
+    with zarr.config.enable_gpu(), warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ZarrUserWarning)
+        zr = zarr.open_array(store=store, mode="r")
+        out = zr[:]
+
+    assert calls == 1
+    np.testing.assert_array_equal(np.asarray(out), src)
+
+
+@gpu_test
+def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = NvcompBloscCodec._run_nvcomp_zstd_batch
+
+    async def counted(
+        self: NvcompBloscCodec,
+        arrays: object,
+        *,
+        operation: str,
+    ) -> list[object]:
+        nonlocal calls
+        calls += 1
+        return await original(self, arrays, operation=operation)
+
+    monkeypatch.setattr(NvcompBloscCodec, "_run_nvcomp_zstd_batch", counted)
+
+    src = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(
+        store=store,
+        shape=src.shape,
+        chunks=(16, 16),
+        dtype=src.dtype,
+        compressors=BloscCodec(cname="zstd", shuffle="noshuffle", blocksize=256),
+    )
+    z[:, :] = src
+
+    with zarr.config.enable_gpu(), warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ZarrUserWarning)
+        zr = zarr.open_array(store=store, mode="r")
+        out = zr[:, :]
+
+    assert calls == 1
+    np.testing.assert_array_equal(np.asarray(out), src)
