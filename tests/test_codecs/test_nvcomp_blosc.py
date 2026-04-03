@@ -59,6 +59,8 @@ def test_nvcomp_blosc_decode_raises_on_byte_shuffle() -> None:
 
 @gpu_test
 def test_nvcomp_blosc_decode_supported_non_float32() -> None:
+    import cupy as cp
+
     src = np.arange(64, dtype=np.float64).reshape(8, 8)
     store = zarr.storage.MemoryStore()
     z = zarr.create_array(
@@ -75,7 +77,8 @@ def test_nvcomp_blosc_decode_supported_non_float32() -> None:
         zr = zarr.open_array(store=store, mode="r")
         out = zr[:, :]
 
-    np.testing.assert_array_equal(np.asarray(out), src)
+    assert isinstance(out, cp.ndarray)
+    cp.testing.assert_array_equal(out, cp.asarray(src))
 
 
 @gpu_test
@@ -102,6 +105,8 @@ def test_nvcomp_blosc_decode_raises_on_non_zstd() -> None:
 def test_nvcomp_blosc_decode_batches_multi_block_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import cupy as cp
+
     calls = 0
     original = NvcompBloscCodec._run_nvcomp_zstd_batch
 
@@ -134,13 +139,16 @@ def test_nvcomp_blosc_decode_batches_multi_block_frames(
         out = zr[:]
 
     assert calls == 1
-    np.testing.assert_array_equal(np.asarray(out), src)
+    assert isinstance(out, cp.ndarray)
+    cp.testing.assert_array_equal(out, cp.asarray(src))
 
 
 @gpu_test
 def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import cupy as cp
+
     calls = 0
     original = NvcompBloscCodec._run_nvcomp_zstd_batch
 
@@ -173,4 +181,5 @@ def test_nvcomp_blosc_decode_batches_multi_chunk_frames(
         out = zr[:, :]
 
     assert calls == 1
-    np.testing.assert_array_equal(np.asarray(out), src)
+    assert isinstance(out, cp.ndarray)
+    cp.testing.assert_array_equal(out, cp.asarray(src))

@@ -120,6 +120,8 @@ def test_uses_default_codec() -> None:
 def test_nvcomp_zstd_batched_decode_uses_single_nvcomp_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import cupy as cp
+
     calls = 0
     original = NvcompZstdCodec._run_nvcomp_zstd_batch
 
@@ -152,7 +154,8 @@ def test_nvcomp_zstd_batched_decode_uses_single_nvcomp_call(
         out = zr[:, :]
 
     assert calls == 1
-    np.testing.assert_array_equal(np.asarray(out), src)
+    assert isinstance(out, cp.ndarray)
+    cp.testing.assert_array_equal(out, cp.asarray(src))
 
 
 def test_invalid_raises() -> None:

@@ -1,14 +1,18 @@
 # Using GPUs with Zarr
 
-Zarr can use GPUs to accelerate your workload by running `zarr.Config.enable_gpu`.
+Zarr can use GPUs to accelerate your workload by enabling GPU buffers and codecs
+with `zarr.config.enable_gpu()`.
 
 !!! note
-    GPU codec acceleration is currently available for the Blosc codec when all of
-    the following hold:
+    With `enable_gpu()`:
 
-    - `cname="zstd"`
-    - `shuffle` is `bitshuffle` or `noshuffle`
-    - array dtype is `float32`
+    - array reads return `cupy.ndarray` values
+    - the default Zarr v3 `zstd` codec is replaced with a GPU-backed nvCOMP
+      implementation
+    - Blosc chunks can be decoded on the GPU when `cname="zstd"` and `shuffle`
+      is `bitshuffle` or `noshuffle`
+
+    Blosc GPU acceleration currently applies to decode only.
 
 ## Reading data into device memory
 
