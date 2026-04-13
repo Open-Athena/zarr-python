@@ -11,6 +11,8 @@ from zarr.core.sync import (
     _get_executor,
     _get_lock,
     _get_loop,
+    _run_loop_forever,
+    _set_gpu_device,
     cleanup_resources,
     loop,
     sync,
@@ -163,3 +165,86 @@ def test_cleanup_resources_idempotent() -> None:
     _get_executor()  # trigger resource creation (iothread, loop, thread-pool)
     cleanup_resources()
     cleanup_resources()
+
+
+def test_get_executor_uses_current_gpu_device_for_initializer(
+    clean_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeLoop:
+        def set_default_executor(self, executor: object) -> None:
+            captured["default_executor"] = executor
+
+    class FakeExecutor:
+        def __init__(
+            self,
+            *,
+            max_workers: int | None,
+            thread_name_prefix: str,
+            initializer: object,
+            initargs: tuple[object, ...],
+        ) -> None:
+            captured["max_workers"] = max_workers
+            captured["thread_name_prefix"] = thread_name_prefix
+            captured["initializer"] = initializer
+            captured["initargs"] = initargs
+
+        def shutdown(self, wait: bool, cancel_futures: bool) -> None:
+            captured["shutdown"] = (wait, cancel_futures)
+
+    monkeypatch.setattr("zarr.core.sync._get_loop", lambda: FakeLoop())
+    monkeypatch.setattr("zarr.core.sync.ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr("zarr.core.sync._get_current_gpu_device_id", lambda: 1)
+
+    executor = _get_executor()
+
+    assert captured["default_executor"] is executor
+    assert captured["initializer"] is _set_gpu_device
+    assert captured["initargs"] == (1,)
+
+
+def test_get_loop_binds_io_thread_to_current_gpu_device(
+    clean_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeLoop:
+        def call_soon_threadsafe(self, callback: object) -> None:
+            captured["callback"] = callback
+
+        def stop(self) -> None:
+            captured["stopped"] = True
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    class FakeThread:
+        daemon: bool
+
+        def __init__(self, *, target: object, args: tuple[object, ...], name: str) -> None:
+            captured["target"] = target
+            captured["args"] = args
+            captured["name"] = name
+
+        def start(self) -> None:
+            captured["started"] = True
+
+        def join(self, timeout: float | None = None) -> None:
+            captured["joined"] = timeout
+
+        def is_alive(self) -> bool:
+            return False
+
+    fake_loop = FakeLoop()
+    monkeypatch.setattr("zarr.core.sync.asyncio.new_event_loop", lambda: fake_loop)
+    monkeypatch.setattr("zarr.core.sync.threading.Thread", FakeThread)
+    monkeypatch.setattr("zarr.core.sync._get_current_gpu_device_id", lambda: 1)
+
+    observed_loop = _get_loop()
+
+    assert observed_loop is fake_loop
+    assert captured["target"] is _run_loop_forever
+    assert captured["args"] == (fake_loop, 1)
+    assert captured["name"] == "zarr_io"
+    assert captured["started"] is True

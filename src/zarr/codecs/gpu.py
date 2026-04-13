@@ -87,25 +87,24 @@ class _NvcompZstdMixin:
                 f"{codec_name} requires `nvidia-nvcomp-cu12` to {operation} GPU-backed zstd chunks."
             )
 
-    @cached_property
-    def _nvcomp_zstd_codec(self) -> nvcomp.Codec:
+    @staticmethod
+    def _nvcomp_zstd_codec(*, device_id: int, cuda_stream: int) -> nvcomp.Codec:
         assert cp is not None
         assert nvcomp is not None
-        device = cp.cuda.Device()
-        stream = cp.cuda.get_current_stream()
         return nvcomp.Codec(
             algorithm="Zstd",
             bitstream_kind=nvcomp.BitstreamKind.RAW,
-            device_id=device.id,
-            cuda_stream=stream.ptr,
+            device_id=device_id,
+            cuda_stream=cuda_stream,
         )
 
     @staticmethod
-    def _coerce_nvcomp_output(array: Any) -> "cp.ndarray":
-        out = cp.asarray(array)
-        if out.dtype != np.dtype("B"):
-            out = out.view(np.dtype("B"))
-        return out
+    def _coerce_nvcomp_output(array: Any, *, device_id: int) -> "cp.ndarray":
+        with cp.cuda.Device(device_id):
+            out = cp.asarray(array)
+            if out.dtype != np.dtype("B"):
+                out = out.view(np.dtype("B"))
+            return out
 
     async def _run_nvcomp_zstd_batch(
         self,
@@ -117,11 +116,22 @@ class _NvcompZstdMixin:
         if not array_list:
             return []
 
-        outputs = getattr(self._nvcomp_zstd_codec, operation)(nvcomp.as_arrays(array_list))
-        event = cp.cuda.Event()
-        event.record()
+        device_ids = {int(array.device.id) for array in array_list}
+        if len(device_ids) != 1:
+            raise ValueError(
+                "All arrays in an nvCOMP batch must live on the same CUDA device. "
+                f"Got devices {sorted(device_ids)}."
+            )
+        device_id = next(iter(device_ids))
+
+        with cp.cuda.Device(device_id):
+            stream = cp.cuda.get_current_stream()
+            codec = self._nvcomp_zstd_codec(device_id=device_id, cuda_stream=stream.ptr)
+            outputs = getattr(codec, operation)(nvcomp.as_arrays(array_list))
+            event = cp.cuda.Event()
+            event.record()
         await asyncio.to_thread(event.synchronize)
-        return [self._coerce_nvcomp_output(output) for output in outputs]
+        return [self._coerce_nvcomp_output(output, device_id=device_id) for output in outputs]
 
 
 @dataclass(frozen=True)
@@ -294,10 +304,11 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
 
     @staticmethod
     def _bitunshuffle(src: "cp.ndarray", *, typesize: int, n_elements: int) -> "cp.ndarray":
-        bits = cp.unpackbits(src, bitorder="little")
-        matrix = bits.reshape((typesize * 8, n_elements))
-        out_bits = matrix.T.reshape((-1,))
-        return cp.packbits(out_bits, bitorder="little")
+        with cp.cuda.Device(src.device.id):
+            bits = cp.unpackbits(src, bitorder="little")
+            matrix = bits.reshape((typesize * 8, n_elements))
+            out_bits = matrix.T.reshape((-1,))
+            return cp.packbits(out_bits, bitorder="little")
 
     @staticmethod
     def _bitunshuffle_blocks(
@@ -307,10 +318,11 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
         blocksize: int,
         nblocks: int,
     ) -> "cp.ndarray":
-        bits = cp.unpackbits(src, bitorder="little")
-        matrix = bits.reshape((nblocks, typesize * 8, blocksize // typesize))
-        out_bits = matrix.transpose((0, 2, 1)).reshape((-1,))
-        return cp.packbits(out_bits, bitorder="little")
+        with cp.cuda.Device(src.device.id):
+            bits = cp.unpackbits(src, bitorder="little")
+            matrix = bits.reshape((nblocks, typesize * 8, blocksize // typesize))
+            out_bits = matrix.transpose((0, 2, 1)).reshape((-1,))
+            return cp.packbits(out_bits, bitorder="little")
 
     @cached_property
     def _scatter_segments_kernel(self) -> cp.RawKernel:
@@ -430,56 +442,58 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
             lengths[idx] = segment.length
 
         threads = 256
-        self._scatter_segments_kernel(
-            (len(chunk_plan.segments),),
-            (threads,),
-            (
-                cp.asarray(src_ptrs),
-                cp.asarray(dst_offsets),
-                cp.asarray(lengths),
-                chunk_plan.scratch,
-            ),
-        )
+        with cp.cuda.Device(chunk_plan.scratch.device.id):
+            self._scatter_segments_kernel(
+                (len(chunk_plan.segments),),
+                (threads,),
+                (
+                    cp.asarray(src_ptrs),
+                    cp.asarray(dst_offsets),
+                    cp.asarray(lengths),
+                    chunk_plan.scratch,
+                ),
+            )
 
     def _apply_bitshuffle(self, chunk_plan: _BloscChunkPlan) -> None:
         bitshuffle = chunk_plan.bitshuffle
         if bitshuffle is None:
             return
 
-        full_block_bytes = bitshuffle.full_block_bytes
-        if full_block_bytes > 0:
-            window_blocks = max(1, self.bitshuffle_max_bytes // bitshuffle.blocksize)
-            window_bytes = window_blocks * bitshuffle.blocksize
-            for start in range(0, full_block_bytes, window_bytes):
-                stop = min(start + window_bytes, full_block_bytes)
-                nblocks = (stop - start) // bitshuffle.blocksize
-                chunk_plan.scratch[start:stop] = self._bitunshuffle_blocks(
-                    chunk_plan.scratch[start:stop],
-                    typesize=bitshuffle.typesize,
-                    blocksize=bitshuffle.blocksize,
-                    nblocks=nblocks,
+        with cp.cuda.Device(chunk_plan.scratch.device.id):
+            full_block_bytes = bitshuffle.full_block_bytes
+            if full_block_bytes > 0:
+                window_blocks = max(1, self.bitshuffle_max_bytes // bitshuffle.blocksize)
+                window_bytes = window_blocks * bitshuffle.blocksize
+                for start in range(0, full_block_bytes, window_bytes):
+                    stop = min(start + window_bytes, full_block_bytes)
+                    nblocks = (stop - start) // bitshuffle.blocksize
+                    chunk_plan.scratch[start:stop] = self._bitunshuffle_blocks(
+                        chunk_plan.scratch[start:stop],
+                        typesize=bitshuffle.typesize,
+                        blocksize=bitshuffle.blocksize,
+                        nblocks=nblocks,
+                    )
+
+            if bitshuffle.tail_bytes == 0:
+                return
+
+            tail_start = full_block_bytes
+            tail_stop = tail_start + bitshuffle.tail_bytes
+            if bitshuffle.tail_bytes % bitshuffle.typesize != 0:
+                raise ValueError(
+                    "Invalid bitshuffle payload: "
+                    f"block bytes {bitshuffle.tail_bytes} not divisible by typesize {bitshuffle.typesize}."
                 )
-
-        if bitshuffle.tail_bytes == 0:
-            return
-
-        tail_start = full_block_bytes
-        tail_stop = tail_start + bitshuffle.tail_bytes
-        if bitshuffle.tail_bytes % bitshuffle.typesize != 0:
-            raise ValueError(
-                "Invalid bitshuffle payload: "
-                f"block bytes {bitshuffle.tail_bytes} not divisible by typesize {bitshuffle.typesize}."
+            n_elements = bitshuffle.tail_bytes // bitshuffle.typesize
+            if n_elements % 8 != 0:
+                raise ValueError(
+                    "NvcompBloscCodec only supports bitshuffle blocks with element count divisible by 8."
+                )
+            chunk_plan.scratch[tail_start:tail_stop] = self._bitunshuffle(
+                chunk_plan.scratch[tail_start:tail_stop],
+                typesize=bitshuffle.typesize,
+                n_elements=n_elements,
             )
-        n_elements = bitshuffle.tail_bytes // bitshuffle.typesize
-        if n_elements % 8 != 0:
-            raise ValueError(
-                "NvcompBloscCodec only supports bitshuffle blocks with element count divisible by 8."
-            )
-        chunk_plan.scratch[tail_start:tail_stop] = self._bitunshuffle(
-            chunk_plan.scratch[tail_start:tail_stop],
-            typesize=bitshuffle.typesize,
-            n_elements=n_elements,
-        )
 
     def _parse_split_headers(
         self,
@@ -491,32 +505,34 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
         cbytes: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         total_splits = int(split_counts.sum())
-        src_offsets = cp.empty((total_splits,), dtype=cp.int64)
-        src_lengths = cp.empty((total_splits,), dtype=cp.int64)
-        error_code = cp.zeros((1,), dtype=cp.int32)
+        with cp.cuda.Device(source.device.id):
+            src_offsets = cp.empty((total_splits,), dtype=cp.int64)
+            src_lengths = cp.empty((total_splits,), dtype=cp.int64)
+            error_code = cp.zeros((1,), dtype=cp.int32)
 
-        self._parse_split_headers_kernel(
-            (len(bstarts),),
-            (1,),
-            (
-                source,
-                cp.asarray(bstarts),
-                cp.asarray(split_counts),
-                cp.asarray(split_bases),
-                np.int64(cbytes),
-                src_offsets,
-                src_lengths,
-                error_code,
-            ),
-        )
+            self._parse_split_headers_kernel(
+                (len(bstarts),),
+                (1,),
+                (
+                    source,
+                    cp.asarray(bstarts),
+                    cp.asarray(split_counts),
+                    cp.asarray(split_bases),
+                    np.int64(cbytes),
+                    src_offsets,
+                    src_lengths,
+                    error_code,
+                ),
+            )
 
-        error_code_host = int(cp.asnumpy(error_code)[0])
+            error_code_host = int(cp.asnumpy(error_code)[0])
         if error_code_host == 1:
             raise ValueError("Invalid Blosc payload: split header outside payload.")
         if error_code_host in (2, 3):
             raise ValueError("Invalid Blosc payload: split data outside payload.")
 
-        return cp.asnumpy(src_offsets), cp.asnumpy(src_lengths)
+        with cp.cuda.Device(source.device.id):
+            return cp.asnumpy(src_offsets), cp.asnumpy(src_lengths)
 
     def _build_chunk_plan(
         self,
@@ -526,144 +542,149 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
         chunk_spec: ArraySpec,
         decode_inputs: list["cp.ndarray"],
     ) -> _BloscChunkPlan | Buffer:
-        if source.size < _BLOSC_MAX_OVERHEAD:
-            raise ValueError(
-                f"Invalid Blosc payload: expected at least {_BLOSC_MAX_OVERHEAD} bytes, got {source.size}."
-            )
-
-        header = memoryview(cp.asnumpy(source[:_BLOSC_MAX_OVERHEAD]))
-        _, _, flags, typesize, nbytes, blocksize, cbytes = struct.unpack_from("<BBBBIII", header, 0)
-        if source.size < cbytes:
-            raise ValueError(
-                f"Invalid Blosc payload: cbytes={cbytes} larger than available bytes={source.size}."
-            )
-        source = source[:cbytes]
-
-        is_memcpyed = (flags & _BLOSC_FLAG_MEMCPYED) != 0
-        do_shuffle = (flags & _BLOSC_FLAG_DOSHUFFLE) != 0
-        do_bitshuffle = (flags & _BLOSC_FLAG_DOBITSHUFFLE) != 0
-        dont_split = (flags & _BLOSC_FLAG_DONT_SPLIT) != 0
-        compformat = (flags & 0xE0) >> 5
-
-        if do_shuffle:
-            raise ValueError("NvcompBloscCodec does not support byte-shuffle Blosc chunks.")
-        if compformat != _BLOSC_COMPFORMAT_ZSTD:
-            raise ValueError(
-                "NvcompBloscCodec only supports Blosc chunks with cname='zstd'. "
-                f"Got compformat={compformat}."
-            )
-
-        if is_memcpyed:
-            if cbytes < _BLOSC_MAX_OVERHEAD + nbytes:
-                raise ValueError("Invalid memcpyed Blosc payload: missing raw bytes after header.")
-            raw = source[_BLOSC_MAX_OVERHEAD : _BLOSC_MAX_OVERHEAD + nbytes]
-            return chunk_spec.prototype.buffer.from_array_like(raw.copy())
-
-        if blocksize == 0:
-            raise ValueError("Invalid Blosc payload: blocksize must be > 0.")
-        if nbytes % typesize != 0:
-            raise ValueError(
-                f"Invalid Blosc payload: nbytes={nbytes} is not divisible by typesize={typesize}."
-            )
-
-        leftover = nbytes % blocksize
-        nblocks = nbytes // blocksize + (1 if leftover else 0)
-
-        bstarts_offset = _BLOSC_MAX_OVERHEAD
-        bstarts_size = nblocks * 4
-        bstarts_end = bstarts_offset + bstarts_size
-        if cbytes < bstarts_end:
-            raise ValueError("Invalid Blosc payload: missing block-start table.")
-
-        bstarts = np.frombuffer(
-            cp.asnumpy(source[bstarts_offset:bstarts_end]).tobytes(), dtype="<i4", count=nblocks
-        )
-
-        scratch = cp.empty((nbytes,), dtype=cp.uint8)
-        split_counts = np.empty((nblocks,), dtype=np.int32)
-        split_bases = np.empty((nblocks,), dtype=np.int64)
-        total_splits = 0
-
-        for block_index in range(nblocks):
-            bsize = leftover if (block_index == nblocks - 1 and leftover > 0) else blocksize
-            leftover_block = block_index == nblocks - 1 and leftover > 0
-            nsplits = self._split_count(
-                typesize=typesize,
-                blocksize=bsize,
-                dont_split=dont_split,
-                leftover_block=leftover_block,
-            )
-            if bsize % nsplits != 0:
+        with cp.cuda.Device(source.device.id):
+            if source.size < _BLOSC_MAX_OVERHEAD:
                 raise ValueError(
-                    f"Invalid Blosc payload: blocksize {bsize} not divisible by nsplits {nsplits}."
+                    f"Invalid Blosc payload: expected at least {_BLOSC_MAX_OVERHEAD} bytes, got {source.size}."
                 )
 
-            split_counts[block_index] = nsplits
-            split_bases[block_index] = total_splits
-            total_splits += nsplits
-
-        src_offsets, src_lengths = self._parse_split_headers(
-            source,
-            bstarts=bstarts,
-            split_counts=split_counts,
-            split_bases=split_bases,
-            cbytes=cbytes,
-        )
-
-        segments: list[_BloscSegmentPlan] = []
-        split_index_global = 0
-        for block_index in range(nblocks):
-            bsize = leftover if (block_index == nblocks - 1 and leftover > 0) else blocksize
-            leftover_block = block_index == nblocks - 1 and leftover > 0
-            nsplits = self._split_count(
-                typesize=typesize,
-                blocksize=bsize,
-                dont_split=dont_split,
-                leftover_block=leftover_block,
+            header = memoryview(cp.asnumpy(source[:_BLOSC_MAX_OVERHEAD]))
+            _, _, flags, typesize, nbytes, blocksize, cbytes = struct.unpack_from(
+                "<BBBBIII", header, 0
             )
-            neblock = bsize // nsplits
-            block_start = block_index * blocksize
-            for split_index in range(nsplits):
-                csize = int(src_lengths[split_index_global])
-                src_offset = int(src_offsets[split_index_global])
-                split = source[src_offset : src_offset + csize]
-                dest_offset = block_start + split_index * neblock
-                if csize == neblock:
-                    segments.append(
-                        _BloscSegmentPlan(
-                            dest_offset=dest_offset,
-                            length=neblock,
-                            raw_source=split,
-                        )
-                    )
-                else:
-                    decode_index = len(decode_inputs)
-                    decode_inputs.append(split)
-                    segments.append(
-                        _BloscSegmentPlan(
-                            dest_offset=dest_offset,
-                            length=neblock,
-                            decode_index=decode_index,
-                        )
-                    )
-                split_index_global += 1
+            if source.size < cbytes:
+                raise ValueError(
+                    f"Invalid Blosc payload: cbytes={cbytes} larger than available bytes={source.size}."
+                )
+            source = source[:cbytes]
 
-        bitshuffle = None
-        if do_bitshuffle:
-            bitshuffle = _BloscBitshufflePlan(
-                typesize=typesize,
-                blocksize=blocksize,
-                full_block_bytes=(nblocks - (1 if leftover else 0)) * blocksize,
-                tail_bytes=leftover,
+            is_memcpyed = (flags & _BLOSC_FLAG_MEMCPYED) != 0
+            do_shuffle = (flags & _BLOSC_FLAG_DOSHUFFLE) != 0
+            do_bitshuffle = (flags & _BLOSC_FLAG_DOBITSHUFFLE) != 0
+            dont_split = (flags & _BLOSC_FLAG_DONT_SPLIT) != 0
+            compformat = (flags & 0xE0) >> 5
+
+            if do_shuffle:
+                raise ValueError("NvcompBloscCodec does not support byte-shuffle Blosc chunks.")
+            if compformat != _BLOSC_COMPFORMAT_ZSTD:
+                raise ValueError(
+                    "NvcompBloscCodec only supports Blosc chunks with cname='zstd'. "
+                    f"Got compformat={compformat}."
+                )
+
+            if is_memcpyed:
+                if cbytes < _BLOSC_MAX_OVERHEAD + nbytes:
+                    raise ValueError("Invalid memcpyed Blosc payload: missing raw bytes after header.")
+                raw = source[_BLOSC_MAX_OVERHEAD : _BLOSC_MAX_OVERHEAD + nbytes]
+                return chunk_spec.prototype.buffer.from_array_like(raw.copy())
+
+            if blocksize == 0:
+                raise ValueError("Invalid Blosc payload: blocksize must be > 0.")
+            if nbytes % typesize != 0:
+                raise ValueError(
+                    f"Invalid Blosc payload: nbytes={nbytes} is not divisible by typesize={typesize}."
+                )
+
+            leftover = nbytes % blocksize
+            nblocks = nbytes // blocksize + (1 if leftover else 0)
+
+            bstarts_offset = _BLOSC_MAX_OVERHEAD
+            bstarts_size = nblocks * 4
+            bstarts_end = bstarts_offset + bstarts_size
+            if cbytes < bstarts_end:
+                raise ValueError("Invalid Blosc payload: missing block-start table.")
+
+            bstarts = np.frombuffer(
+                cp.asnumpy(source[bstarts_offset:bstarts_end]).tobytes(),
+                dtype="<i4",
+                count=nblocks,
             )
 
-        return _BloscChunkPlan(
-            index=index,
-            scratch=scratch,
-            chunk_spec=chunk_spec,
-            segments=tuple(segments),
-            bitshuffle=bitshuffle,
-        )
+            scratch = cp.empty((nbytes,), dtype=cp.uint8)
+            split_counts = np.empty((nblocks,), dtype=np.int32)
+            split_bases = np.empty((nblocks,), dtype=np.int64)
+            total_splits = 0
+
+            for block_index in range(nblocks):
+                bsize = leftover if (block_index == nblocks - 1 and leftover > 0) else blocksize
+                leftover_block = block_index == nblocks - 1 and leftover > 0
+                nsplits = self._split_count(
+                    typesize=typesize,
+                    blocksize=bsize,
+                    dont_split=dont_split,
+                    leftover_block=leftover_block,
+                )
+                if bsize % nsplits != 0:
+                    raise ValueError(
+                        f"Invalid Blosc payload: blocksize {bsize} not divisible by nsplits {nsplits}."
+                    )
+
+                split_counts[block_index] = nsplits
+                split_bases[block_index] = total_splits
+                total_splits += nsplits
+
+            src_offsets, src_lengths = self._parse_split_headers(
+                source,
+                bstarts=bstarts,
+                split_counts=split_counts,
+                split_bases=split_bases,
+                cbytes=cbytes,
+            )
+
+            segments: list[_BloscSegmentPlan] = []
+            split_index_global = 0
+            for block_index in range(nblocks):
+                bsize = leftover if (block_index == nblocks - 1 and leftover > 0) else blocksize
+                leftover_block = block_index == nblocks - 1 and leftover > 0
+                nsplits = self._split_count(
+                    typesize=typesize,
+                    blocksize=bsize,
+                    dont_split=dont_split,
+                    leftover_block=leftover_block,
+                )
+                neblock = bsize // nsplits
+                block_start = block_index * blocksize
+                for split_index in range(nsplits):
+                    csize = int(src_lengths[split_index_global])
+                    src_offset = int(src_offsets[split_index_global])
+                    split = source[src_offset : src_offset + csize]
+                    dest_offset = block_start + split_index * neblock
+                    if csize == neblock:
+                        segments.append(
+                            _BloscSegmentPlan(
+                                dest_offset=dest_offset,
+                                length=neblock,
+                                raw_source=split,
+                            )
+                        )
+                    else:
+                        decode_index = len(decode_inputs)
+                        decode_inputs.append(split)
+                        segments.append(
+                            _BloscSegmentPlan(
+                                dest_offset=dest_offset,
+                                length=neblock,
+                                decode_index=decode_index,
+                            )
+                        )
+                    split_index_global += 1
+
+            bitshuffle = None
+            if do_bitshuffle:
+                bitshuffle = _BloscBitshufflePlan(
+                    typesize=typesize,
+                    blocksize=blocksize,
+                    full_block_bytes=(nblocks - (1 if leftover else 0)) * blocksize,
+                    tail_bytes=leftover,
+                )
+
+            return _BloscChunkPlan(
+                index=index,
+                scratch=scratch,
+                chunk_spec=chunk_spec,
+                segments=tuple(segments),
+                bitshuffle=bitshuffle,
+            )
 
     async def decode(
         self,
@@ -701,11 +722,12 @@ class NvcompBloscCodec(_NvcompZstdMixin, BloscCodec):
             decoded_splits = await self._run_nvcomp_zstd_batch(decode_inputs, operation="decode")
 
         for chunk_plan in gpu_chunk_plans:
-            self._scatter_segments(chunk_plan, decoded_splits)
-            self._apply_bitshuffle(chunk_plan)
-            results[chunk_plan.index] = chunk_plan.chunk_spec.prototype.buffer.from_array_like(
-                chunk_plan.scratch
-            )
+            with cp.cuda.Device(chunk_plan.scratch.device.id):
+                self._scatter_segments(chunk_plan, decoded_splits)
+                self._apply_bitshuffle(chunk_plan)
+                results[chunk_plan.index] = chunk_plan.chunk_spec.prototype.buffer.from_array_like(
+                    chunk_plan.scratch
+                )
 
         if cpu_entries:
             cpu_outputs = await concurrent_map(

@@ -31,6 +31,22 @@ except ImportError:
     cp = None
 
 
+def _array_device_id(array_like: Any) -> int | None:
+    device = getattr(array_like, "device", None)
+    device_id = getattr(device, "id", None)
+    if device_id is None:
+        return None
+    return int(device_id)
+
+
+def _as_gpu_array(array_like: Any) -> Any:
+    device_id = _array_device_id(array_like)
+    if device_id is None:
+        return cp.asarray(array_like)
+    with cp.cuda.Device(device_id):
+        return cp.asarray(array_like)
+
+
 class Buffer(core.Buffer):
     """A flat contiguous memory block on the GPU
 
@@ -76,7 +92,7 @@ class Buffer(core.Buffer):
                 category=ZarrUserWarning,
                 stacklevel=2,
             )
-        self._data = cp.asarray(array_like)
+        self._data = _as_gpu_array(array_like)
 
     @classmethod
     def create_zero_length(cls) -> Self:
@@ -165,7 +181,7 @@ class NDBuffer(core.NDBuffer):
                 msg,
                 stacklevel=2,
             )
-        self._data = cp.asarray(array)
+        self._data = _as_gpu_array(array)
 
     @classmethod
     def create(

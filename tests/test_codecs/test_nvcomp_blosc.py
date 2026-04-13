@@ -9,6 +9,7 @@ import zarr
 from zarr.codecs import NvcompBloscCodec
 from zarr.codecs.blosc import BloscCodec
 from zarr.errors import ZarrUserWarning
+from zarr.core.sync import cleanup_resources
 from zarr.testing.utils import gpu_test
 
 
@@ -291,4 +292,36 @@ def test_nvcomp_blosc_bitshuffle_windowing_batches_full_blocks(
 
     assert calls == src.nbytes // 512
     assert isinstance(out, cp.ndarray)
+    cp.testing.assert_array_equal(out, cp.asarray(src))
+
+
+@gpu_test
+def test_nvcomp_blosc_decode_respects_current_cuda_device() -> None:
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("needs at least 2 CUDA devices")
+
+    src = np.arange(256, dtype=np.float32).reshape(16, 16)
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(
+        store=store,
+        shape=src.shape,
+        chunks=(8, 8),
+        dtype=src.dtype,
+        compressors=BloscCodec(cname="zstd", shuffle="noshuffle"),
+    )
+    z[:, :] = src
+
+    cleanup_resources()
+    try:
+        with cp.cuda.Device(1), zarr.config.enable_gpu(), warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ZarrUserWarning)
+            zr = zarr.open_array(store=store, mode="r")
+            out = zr[:, :]
+    finally:
+        cleanup_resources()
+
+    assert isinstance(out, cp.ndarray)
+    assert out.device.id == 1
     cp.testing.assert_array_equal(out, cp.asarray(src))
