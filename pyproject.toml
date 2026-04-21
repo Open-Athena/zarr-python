@@ -68,6 +68,7 @@ remote = [
 ]
 gpu = [
     "cupy-cuda12x",
+    "nvidia-nvcomp-cu12",
 ]
 cli = ["typer"]
 # Testing extras
@@ -153,6 +154,9 @@ omit = [
 
 [tool.hatch]
 version.source = "vcs"
+
+[tool.hatch.version.raw-options]
+fallback_version = "3.1.0"
 
 [tool.hatch.build]
 hooks.vcs.version-file = "src/zarr/_version.py"

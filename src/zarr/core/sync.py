@@ -36,6 +36,39 @@ class SyncError(Exception):
     pass
 
 
+def _get_current_gpu_device_id() -> int | None:
+    try:
+        import cupy as cp
+    except ImportError:
+        return None
+
+    try:
+        return int(cp.cuda.Device().id)
+    except Exception:
+        return None
+
+
+def _set_gpu_device(device_id: int | None) -> None:
+    if device_id is None:
+        return
+
+    try:
+        import cupy as cp
+    except ImportError:
+        return
+
+    cp.cuda.Device(device_id).use()
+
+
+def _run_loop_forever(
+    event_loop: asyncio.AbstractEventLoop,
+    gpu_device_id: int | None,
+) -> None:
+    _set_gpu_device(gpu_device_id)
+    asyncio.set_event_loop(event_loop)
+    event_loop.run_forever()
+
+
 def _get_lock() -> threading.Lock:
     """Allocate or return a threading lock.
 
@@ -55,8 +88,14 @@ def _get_executor() -> ThreadPoolExecutor:
     global _executor
     if not _executor:
         max_workers = config.get("threading.max_workers", None)
+        gpu_device_id = _get_current_gpu_device_id()
         logger.debug("Creating Zarr ThreadPoolExecutor with max_workers=%s", max_workers)
-        _executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="zarr_pool")
+        _executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="zarr_pool",
+            initializer=_set_gpu_device,
+            initargs=(gpu_device_id,),
+        )
         _get_loop().set_default_executor(_executor)
     return _executor
 
@@ -173,8 +212,13 @@ def _get_loop() -> asyncio.AbstractEventLoop:
             if loop[0] is None:
                 logger.debug("Creating Zarr event loop")
                 new_loop = asyncio.new_event_loop()
+                gpu_device_id = _get_current_gpu_device_id()
                 loop[0] = new_loop
-                iothread[0] = threading.Thread(target=new_loop.run_forever, name="zarr_io")
+                iothread[0] = threading.Thread(
+                    target=_run_loop_forever,
+                    args=(new_loop, gpu_device_id),
+                    name="zarr_io",
+                )
                 assert iothread[0] is not None
                 iothread[0].daemon = True
                 iothread[0].start()
